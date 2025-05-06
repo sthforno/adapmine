@@ -3553,7 +3553,7 @@ void print_stata(Graph *g, Pattern &pattern, schedule_approx &schedule) {
     }
 }
 
-void scheduel_generate_for_ns_adapted(const Schedule_IEP &sched, schedule_approx *schedule) {
+void scheduel_generate_for_adap_ns(const Schedule_IEP &sched, schedule_approx *schedule) {
     // 先对矩阵进行排序
     int size = sched.get_size();
     int *adj_mat = new int[size * size];
@@ -7414,7 +7414,7 @@ int main(int argc, char *argv[]) {
     Schedule_IEP schedule_iep(pattern, is_pattern_valid, 1, 1, use_in_exclusion_optimize, g->v_cnt, g->e_cnt, g->tri_cnt);
     schedule_approx schedule;
     // scheduel_generate_approx_for_ns(&pattern, &schedule);
-    scheduel_generate_for_ns_adapted(schedule_iep, &schedule);
+    scheduel_generate_for_adap_ns(schedule_iep, &schedule);
     g->degree = (uint32_t *)malloc(sizeof(uint32_t) * g->v_cnt);
     uint64_t max_degree = 0;
     for (int i = 0; i < g->v_cnt; i++) {
