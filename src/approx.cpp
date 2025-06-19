@@ -39,42 +39,6 @@ int threshhold_computing(Graph *g) {
     return threshhold;
 }
 
-struct filter {
-
-    uint32_t *record;
-    uint32_t *degree;
-    uint32_t edge_size;
-
-    // 边上的采样估计和采样次数，以及是否被移除
-    uint32_t *sample_times_per_edge;
-    double *sample_count_per_edge;
-    double *sample_square_per_edge;
-
-    bool *delete_edge;
-
-    // 记录顶点和边的轻重
-    int *vertex_record;
-    int *edge_record;
-    int64_t *edge_project;
-    int *vertex_project;
-};
-
-//==================================================================================================================================================//
-//========过滤+无放回+es和ns的混合====================================================================================================================//
-//==================================================================================================================================================//
-
-//==================================================================================================================================================//
-//===========调度方案构建============================================================================================================================//
-//==================================================================================================================================================//
-
-void scheduel_motif_generate_approx(Pattern P, uint32_t pattern_size) {
-    MotifGenerator mg(pattern_size);
-    std::vector<Pattern> motifs = mg.generate();
-    for (int i = 0; i < motifs.size(); ++i) {
-        Pattern p = motifs[i];
-    }
-}
-
 // 输入：模式的邻接矩阵和大小
 // 输出：调度方案
 
@@ -105,6 +69,153 @@ struct schedule_approx {
     // 为es构建约束打破对称性
     // 待实现功能   1，为es施加约束打破对称性，同时满足随机选择要求  2，b,复用部分计算结果 c，将计算提到循环之前（只有es需要）。
 };
+
+struct filter {
+
+    uint32_t *record;
+    uint32_t *degree;
+    uint32_t edge_size;
+
+    // 边上的采样估计和采样次数，以及是否被移除
+    uint32_t *sample_times_per_edge;
+    double *sample_count_per_edge;
+    double *sample_square_per_edge;
+    bool *delete_edge;
+
+    // 区域内的采样估计和采样次数
+    int num_of_thread;
+    uint32_t **sample_times_per_region;
+    double **sample_count_per_region;
+    double **sample_square_per_region;
+
+    // 记录顶点和边的颜色
+    int *vertex_record;
+    int *edge_record;
+
+    // 原始的顶点和边
+    int64_t *edge_project;
+    int *vertex_project;
+
+    // 不同颜色的边数
+    uint32_t num_of_color;
+    uint64_t *num_of_different_weight_of_edges;
+    uint64_t *prefix_sum_of_edges;
+};
+
+// 初始化过滤的数据结构
+
+int find_range(uint32_t threshhold[], const uint32_t &degree, int size) {
+    for (int i = 0; i < size; i++) {
+        if (degree <= threshhold[i]) {
+            return i - 1;
+        }
+    }
+}
+
+void filter_init(filter *filter_data, Graph *g, schedule_approx *s, uint32_t threshhold[]) {
+
+    // 记录哪些边可以采样
+    filter_data->edge_project = (int64_t *)malloc(sizeof(int64_t) * g->e_cnt);
+    filter_data->edge_record = (int *)malloc(sizeof(int) * g->e_cnt);
+    memset(filter_data->edge_project, -1, sizeof(int64_t) * g->e_cnt);
+    memset(filter_data->edge_record, -1, sizeof(int) * g->e_cnt);
+    filter_data->degree = (uint32_t *)malloc(sizeof(uint32_t) * g->v_cnt);
+    for (int i = 0; i < g->v_cnt; i++) {
+        filter_data->degree[i] = g->vertex[i + 1] - g->vertex[i];
+    }
+
+    // 标记边
+    // 记录每种范围边数据的大小
+    filter_data->num_of_different_weight_of_edges = (uint64_t *)malloc(sizeof(uint64_t) * filter_data->num_of_color);
+    for (uint64_t i = 0; i < filter_data->num_of_color; ++i) {
+        filter_data->num_of_different_weight_of_edges[i] = 0;
+    }
+    for (int i = 0; i < g->v_cnt; ++i) {
+        if (filter_data->degree[i] >= s->order_degree[0]) {
+            for (int64_t j = g->vertex[i]; j < g->vertex[i + 1]; ++j) {
+                uint32_t temp_degree = filter_data->degree[g->edge[j]];
+                if (temp_degree >= s->order_degree[1]) {
+                    int record_edge_color = find_range(threshhold, temp_degree, filter_data->num_of_color + 1);
+                    filter_data->edge_record[j] = record_edge_color;
+                    filter_data->num_of_different_weight_of_edges[record_edge_color]++;
+                }
+            }
+        }
+    }
+
+    // 投射边
+    // 前缀和形式
+    filter_data->prefix_sum_of_edges = new uint64_t[filter_data->num_of_color + 1];
+    filter_data->prefix_sum_of_edges[0] = 0;
+    for (uint32_t i = 1; i < filter_data->num_of_color + 1; i++) {
+        filter_data->prefix_sum_of_edges[i] = filter_data->prefix_sum_of_edges[i - 1] + filter_data->num_of_different_weight_of_edges[i - 1];
+    }
+    uint64_t weight_edge_ptr[filter_data->num_of_color] = {0}; // 只在此处使用，将边按照其出端点的度数分类投射。
+    for (uint i = 0; i < filter_data->num_of_color; i++) {
+        weight_edge_ptr[i] = filter_data->prefix_sum_of_edges[i];
+    }
+    for (uint32_t i = 0; i < g->e_cnt; ++i) {
+        if (filter_data->edge_record[i] != -1)
+            filter_data->edge_project[weight_edge_ptr[filter_data->edge_record[i]]++] = i;
+    }
+
+    // 记录采样结果
+    filter_data->sample_times_per_edge = (uint32_t *)malloc(sizeof(uint32_t) * g->e_cnt);
+    filter_data->sample_count_per_edge = (double *)malloc(sizeof(double) * g->e_cnt);
+    filter_data->sample_square_per_edge = (double *)malloc(sizeof(double) * g->e_cnt);
+    memset(filter_data->sample_times_per_edge, 0, sizeof(uint32_t) * g->e_cnt);
+    memset(filter_data->sample_count_per_edge, 0, sizeof(double) * g->e_cnt);
+    memset(filter_data->sample_square_per_edge, 0, sizeof(double) * g->e_cnt);
+
+    filter_data->num_of_thread = omp_get_max_threads();
+
+    filter_data->sample_times_per_region = (uint32_t **)malloc(sizeof(uint32_t *) * (filter_data->num_of_thread + 1));
+    filter_data->sample_count_per_region = (double **)malloc(sizeof(double *) * (filter_data->num_of_thread + 1));
+    filter_data->sample_square_per_region = (double **)malloc(sizeof(double *) * (filter_data->num_of_thread + 1));
+
+    for (int i = 0; i <= filter_data->num_of_thread; i++) {
+        filter_data->sample_times_per_region[i] = (uint32_t *)malloc(sizeof(uint32_t) * filter_data->num_of_color);
+        filter_data->sample_count_per_region[i] = (double *)malloc(sizeof(double) * filter_data->num_of_color);
+        filter_data->sample_square_per_region[i] = (double *)malloc(sizeof(double) * filter_data->num_of_color);
+        memset(filter_data->sample_times_per_region[i], 0, sizeof(uint32_t) * filter_data->num_of_color);
+        memset(filter_data->sample_count_per_region[i], 0, sizeof(double) * filter_data->num_of_color);
+        memset(filter_data->sample_square_per_region[i], 0, sizeof(double) * filter_data->num_of_color);
+    }
+}
+
+void free_filter_data(filter &filter_data) {
+    free(filter_data.edge_project);
+    free(filter_data.edge_record);
+    free(filter_data.degree);
+    free(filter_data.sample_count_per_edge);
+    free(filter_data.sample_times_per_edge);
+    free(filter_data.sample_square_per_edge);
+
+    for (int i = 0; i <= filter_data.num_of_thread; i++) {
+        free(filter_data.sample_count_per_region[i]);
+        free(filter_data.sample_square_per_region[i]);
+        free(filter_data.sample_times_per_region[i]);
+    }
+    free(filter_data.sample_count_per_region);
+    free(filter_data.sample_square_per_region);
+    free(filter_data.sample_times_per_region);
+}
+
+//==================================================================================================================================================//
+//========过滤+无放回+es和ns的混合====================================================================================================================//
+//==================================================================================================================================================//
+
+//==================================================================================================================================================//
+//===========调度方案构建============================================================================================================================//
+//==================================================================================================================================================//
+
+void scheduel_motif_generate_approx(Pattern P, uint32_t pattern_size) {
+    MotifGenerator mg(pattern_size);
+    std::vector<Pattern> motifs = mg.generate();
+    for (int i = 0; i < motifs.size(); ++i) {
+        Pattern p = motifs[i];
+    }
+}
 
 void restricts_generate_approx(const int *cur_adj_mat, std::vector<std::vector<std::pair<int, int>>> &restricts, int pattern_size) {
     Schedule_IEP schedule(cur_adj_mat, pattern_size);
@@ -508,7 +619,7 @@ void subtraction_optimized(Graph *g, VertexSet &set1, int process_id, schedule_a
     int *label = new int[set1.get_size()];
     memset(label, 0, sizeof(int) * set1.get_size());
 
-    for (int ptr = s->sub_ptr[process_id]; ptr < s->sub_ptr[process_id]; ptr++) {
+    for (int ptr = s->sub_ptr[process_id]; ptr < s->sub_ptr[process_id + 1]; ptr++) {
         int pre_id = s->sub_id[ptr];
         int temp_vtx = matched_vtx[pre_id];
         int loc = binary_search(data, set1.get_size(), temp_vtx);
@@ -851,6 +962,7 @@ void pattern_sample_ns_record(uint32_t edge, Graph *g, schedule_approx *s, filte
     // __sync_fetch_and_add(&filter_data->sample_times_per_edge[edge], 1);
 }
 
+// 会移除无法产生匹配的边
 void pattern_sample_ns_record_filter(uint32_t edge, Graph *g, schedule_approx *s, filter *filter_data) {
 
     std::random_device rd;
@@ -1013,12 +1125,17 @@ void pattern_sample_ns_record_filter(uint32_t edge, Graph *g, schedule_approx *s
     // __sync_fetch_and_add(&filter_data->sample_times_per_edge[edge], 1);
 }
 
-// 传过来的edge是已经满足剪枝要求和对称性要求的了
-void pattern_sample_ns_ceshi(uint32_t edge, Graph *g, schedule_approx *s, uint64_t &sample_count, uint64_t &count_sample_square,
-                             uint64_t &sample_times) {
+// 同时更新域内的记录信息
+void pattern_sample_ns_record_filter_region(uint32_t edge, Graph *g, schedule_approx *s, filter *filter_data, int thread_id, uint32_t threshhold[]) {
 
     std::random_device rd;
     std::default_random_engine gen(rd());
+
+    // 寻找边的颜色领域
+    int region_id = find_range(threshhold, filter_data->degree[g->edge[edge]], filter_data->num_of_color + 1);
+
+    __sync_fetch_and_add(&filter_data->sample_times_per_edge[edge], 1); // 一定要在开始做，否则会产生错误
+    __sync_fetch_and_add(&filter_data->sample_times_per_region[thread_id][region_id], 1);
 
     // 接收到的两个顶点
     uint32_t left_vtx = g->edge_from[edge];
@@ -1033,7 +1150,7 @@ void pattern_sample_ns_ceshi(uint32_t edge, Graph *g, schedule_approx *s, uint64
     matched_vetex[0] = left_vtx;
     matched_vetex[1] = right_vtx;
 
-    uint64_t temp_count = 1;
+    double temp_count = 1;
     // 候选集初始化
     VertexSet candidate_vtx[s->pattern_size];
     for (int i = 0; i < s->pattern_size; i++) {
@@ -1070,7 +1187,7 @@ void pattern_sample_ns_ceshi(uint32_t edge, Graph *g, schedule_approx *s, uint64
             int reuse_id = s->dependcy[s->dependcy_ptr[process_id]];
             candidate_vtx[process_id].copy(candidate_vtx[reuse_id].get_size(), candidate_vtx[reuse_id].get_data_ptr());
 
-            // 与后面的做交接
+            // 与后面的做交集
             VertexSet tmp_vtx_set;
             int tmp_pre_vtx;
             int tmp_vtx_set_size;
@@ -1096,7 +1213,18 @@ void pattern_sample_ns_ceshi(uint32_t edge, Graph *g, schedule_approx *s, uint64
 
         // subtraction(g, candidate_vtx[process_id], matched_vetex_set);
 
+        if (candidate_vtx[process_id].get_size() == 0) {
+            if (process_id == 2)
+                filter_data->delete_edge[edge] = true;
+            return;
+        }
         subtraction_optimized(g, candidate_vtx[process_id], process_id, s, matched_vetex);
+
+        if (candidate_vtx[process_id].get_size() == 0) {
+            if (process_id == 2)
+                filter_data->delete_edge[edge] = true;
+            return;
+        }
 
         // if (candidate_vtx[process_id].get_size() != tmp) {
         //     printf("wrong");
@@ -1104,15 +1232,37 @@ void pattern_sample_ns_ceshi(uint32_t edge, Graph *g, schedule_approx *s, uint64
         // }
 
         // 如果可以用数值计算代替集合计算
-        if (s->compute_depth == process_id) {
-            int size = candidate_vtx[process_id].get_size();
+        if (s->compute_depth == process_id && s->compute_depth != s->pattern_size) {
+            uint64_t size = candidate_vtx[process_id].get_size();
+            uint32_t num = s->pattern_size - s->compute_depth;
 
-            for (int i = 0; i < s->pattern_size - s->compute_depth; i++) {
-                temp_count = temp_count * size / (i + 1);
+            if (size < num) {
+                return;
+            }
+
+            for (int i = 1; i <= num; i++) {
+                temp_count = temp_count * size;
                 size--;
             }
-            sample_count = sample_count + temp_count;
-            count_sample_square += (temp_count * temp_count);
+
+            for (int i = 2; i < process_id; i++) {
+                temp_count *= candidate_vtx[i].get_size();
+            }
+
+            double temp_squra = temp_count * temp_count;
+
+#pragma omp atomic
+            filter_data->sample_count_per_edge[edge] += temp_count;
+
+#pragma omp atomic
+            filter_data->sample_square_per_edge[edge] += temp_squra;
+
+#pragma omp atomic
+            filter_data->sample_count_per_region[thread_id][region_id] += temp_count;
+
+#pragma omp atomic
+            filter_data->sample_square_per_region[thread_id][region_id] += temp_squra;
+
             return;
         }
 
@@ -1126,14 +1276,9 @@ void pattern_sample_ns_ceshi(uint32_t edge, Graph *g, schedule_approx *s, uint64
             matched_vetex_set.push_back(random_vtx);
             matched_vetex[process_id] = random_vtx;
 
-            // 检查交集操作正确性
-            //  for (int i = 0; i <= process_id; i++) {
-            //      if (matched_vetex_set.has_data(matched_vetex[i])) {
-            //          continue;
-            //      } else {
-            //          printf("wrong");
-            //      }
-            //  }
+            if (g->degree[random_vtx] < s->order_degree[process_id]) {
+                return;
+            }
 
         } else {
             return;
@@ -1143,14 +1288,18 @@ void pattern_sample_ns_ceshi(uint32_t edge, Graph *g, schedule_approx *s, uint64
     for (int i = 0; i < s->pattern_size; i++) {
         temp_count = temp_count * candidate_vtx[i].get_size();
     }
-    sample_count += temp_count;
-    uint64_t temp_count1 = temp_count * temp_count;
-    count_sample_square += temp_count1;
-    sample_times++;
+    double temp_squra = temp_count * temp_count;
+#pragma omp atomic
+    filter_data->sample_count_per_edge[edge] += temp_count;
 
-    // if (count_sample_square / sample_times < std::pow((sample_count / sample_times), 2)) {
-    //     printf("error");
-    // }
+#pragma omp atomic
+    filter_data->sample_square_per_edge[edge] += temp_squra;
+
+#pragma omp atomic
+    filter_data->sample_count_per_region[thread_id][region_id] += temp_count;
+
+#pragma omp atomic
+    filter_data->sample_square_per_region[thread_id][region_id] += temp_squra;
 }
 
 uint64_t recur_match(Graph *g, schedule_approx *s, VertexSet *candidate_vtx, VertexSet &matched_vetex_set, uint32_t *matched_vetex, int process_id) {
@@ -1288,6 +1437,15 @@ void pattern_sample_es(uint32_t edge, Graph *g, schedule_approx *s, double &samp
     sample_count += temp_count;
 }
 
+void edge_from_init(Graph *g) {
+    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
+    for (int i = 0; i < g->v_cnt; i++) {
+        for (uint64_t j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
+            g->edge_from[j] = i;
+        }
+    }
+}
+
 void pattern_count_ns(Graph *g, schedule_approx *s) {
 
     // 初始化阈值和记录边的端点
@@ -1296,12 +1454,8 @@ void pattern_count_ns(Graph *g, schedule_approx *s) {
     sparse_threshold = threshhold_computing(g);
     int threshold = sparse_threshold;
     double count = 0;
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+
+    edge_from_init(g);
 
     // 过滤并记录剩余边
     filter filter_data;
@@ -1434,12 +1588,8 @@ void pattern_count_ns_with_symmetry_break(Graph *g, schedule_approx *s) {
     sparse_threshold = threshhold_computing(g);
     int threshold = sparse_threshold;
     double count = 0;
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+
+    edge_from_init(g);
 
     // 过滤并记录剩余边
     filter filter_data;
@@ -1567,12 +1717,8 @@ void pattern_count_ns_partition(Graph *g, schedule_approx *s) {
     sparse_threshold = threshhold_computing(g);
     int threshold = sparse_threshold;
     double count = 0;
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+
+    edge_from_init(g);
 
     // 过滤并记录剩余边
     filter filter_data;
@@ -1701,12 +1847,8 @@ void pattern_count_es(Graph *g, schedule_approx *s) {
     sparse_threshold = threshhold_computing(g);
     int threshold = std::sqrt(g->v_cnt);
     double count = 0;
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+
+    edge_from_init(g);
 
     // 过滤并记录剩余边
     filter filter_data;
@@ -1813,12 +1955,7 @@ void pattern_count_es(Graph *g, schedule_approx *s) {
 void pattern_count_ns_mpi_fix_sample_times(Graph *g, schedule_approx *s) {
 
     // 获取边的起点
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
     // 分布式执行
 
     // 采样批量
@@ -1968,12 +2105,7 @@ void pattern_count_ns_mpi_fix_sample_times(Graph *g, schedule_approx *s) {
 void pattern_count_ns_mpi_fix_error(Graph *g, schedule_approx *s) {
 
     // 获取边的起点
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 分布式执行
 
@@ -2099,7 +2231,6 @@ void pattern_count_ns_mpi_fix_error(Graph *g, schedule_approx *s) {
                     for (int i = 0; i < sampling_step; i++) {
                         auto eid = dist(gen);
                         // pattern_sample_ns(eid, g, s, count_sample, count_sample_square);
-                        pattern_sample_ns_ceshi(eid, g, s, count_sample, count_sample_square, sampling_times);
                     }
 
                     local_count_sample[tailptr % BUFFER_SIZE] = count_sample;
@@ -2158,13 +2289,7 @@ void pattern_count_ns_mpi_fix_error(Graph *g, schedule_approx *s) {
 void pattern_count_ns_mpi_fix_error_filter(Graph *g, schedule_approx *s) {
 
     // 获取边的起点
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
-
+    edge_from_init(g);
     /*过滤操作*/
     // 初始化阈值
     int sparse_threshold = g->e_cnt / g->v_cnt;    // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
@@ -2485,7 +2610,6 @@ void pattern_count_ns_mpi_fix_error_filter(Graph *g, schedule_approx *s) {
                     for (uint64_t i = 0; i < batch_size; i++) {
                         auto eid = filter_data.edge_project[dist(gen) + num_of_light_edges];
                         pattern_sample_ns(eid, g, s, count_sample, count_sample_square);
-                        // pattern_sample_ns_ceshi(eid, g, s, count_sample, count_sample_square, sampling_times);
                     }
                     num_of_batch++;
                     if (num_of_batch > 10000) {
@@ -2711,13 +2835,7 @@ void pattern_matching_aggressive_func(const Schedule_IEP &schedule, VertexSet *v
 //     uint32_t *vtx_record = (uint32_t *)malloc(sizeof(uint32_t) * g->v_cnt);
 //     memset(vtx_record, 0, sizeof(uint32_t) * g->v_cnt);
 
-//     g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-//     for (int i = 0; i < g->v_cnt; i++) {
-//         for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-//             g->edge_from[j] = i;
-//         }
-//     }
-
+// edge_from_init(g);
 //     /*过滤操作*/
 //     // 初始化阈值
 //     int sparse_threshold = g->e_cnt / g->v_cnt;    // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
@@ -2860,12 +2978,8 @@ void pattern_matching_aggressive_func(const Schedule_IEP &schedule, VertexSet *v
 /*关键，要使用与从顶点出发顺序一样的调度顺序*/
 void pattern_count_ns_mpi_fix_error_filter_vertex_after_sample(Graph *g, schedule_approx *s, const Schedule_IEP &schedule_iep, Pattern p) {
     // 获取边的起点
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+
+    edge_from_init(g);
 
     /*过滤操作*/
     // 初始化阈值
@@ -3841,14 +3955,6 @@ void exact_matching(Graph *g, const Schedule_IEP &schedule_iep) {
 
 // 阈值设置，百分之五十原则
 
-int find_range(const int threshhold[], const uint32_t &degree, int size) {
-    for (int i = 0; i < size; i++) {
-        if (degree <= threshhold[i]) {
-            return i - 1;
-        }
-    }
-}
-
 void print_error(double real_error, uint64_t approx_sample_times, bool *flag, int recur_depth, double real_error_local[]) {
 
     std::cout << "error " << real_error << std::endl;
@@ -3875,19 +3981,14 @@ void print_error(double real_error, uint64_t approx_sample_times, bool *flag, in
 
 void adaptive_approximate_exact_fusion(Graph *g, schedule_approx *s, const Schedule_IEP &schedule_iep, Pattern p) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
     // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
     int recur_depth = 50;
     int vertex_depth = 0;
 
-    int threshhold[recur_depth + 1] = {0};
+    uint32_t threshhold[recur_depth + 1] = {0};
     int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
     memset(record_degree, 0, sizeof(int) * g->v_cnt);
     for (int i = 0; i < g->v_cnt; i++) {
@@ -4396,19 +4497,14 @@ void adaptive_approximate_exact_fusion(Graph *g, schedule_approx *s, const Sched
 
 void approximate_exact_fusion_fifty(Graph *g, schedule_approx *s, const Schedule_IEP &schedule_iep, Pattern p) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
     // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
     int recur_depth = 50;
     int vertex_depth = 0;
 
-    int threshhold[recur_depth + 1] = {0};
+    uint32_t threshhold[recur_depth + 1] = {0};
     int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
     memset(record_degree, 0, sizeof(int) * g->v_cnt);
     for (int i = 0; i < g->v_cnt; i++) {
@@ -4859,19 +4955,14 @@ void approximate_exact_fusion_fifty(Graph *g, schedule_approx *s, const Schedule
 
 void approximate_exact_fusion_seventyfive(Graph *g, schedule_approx *s, const Schedule_IEP &schedule_iep, Pattern p) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
     // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
     int recur_depth = 50;
     int vertex_depth = 0;
 
-    int threshhold[recur_depth + 1] = {0};
+    uint32_t threshhold[recur_depth + 1] = {0};
     int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
     memset(record_degree, 0, sizeof(int) * g->v_cnt);
     for (int i = 0; i < g->v_cnt; i++) {
@@ -5323,19 +5414,14 @@ void approximate_exact_fusion_seventyfive(Graph *g, schedule_approx *s, const Sc
 
 void approximate_exact_fusion_fifty_allrange(Graph *g, schedule_approx *s, const Schedule_IEP &schedule_iep, Pattern p) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
     // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
     int recur_depth = 50;
     int vertex_depth = 0;
 
-    int threshhold[recur_depth + 1] = {0};
+    uint32_t threshhold[recur_depth + 1] = {0};
     int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
     memset(record_degree, 0, sizeof(int) * g->v_cnt);
     for (int i = 0; i < g->v_cnt; i++) {
@@ -5729,19 +5815,14 @@ void approximate_exact_fusion_fifty_allrange(Graph *g, schedule_approx *s, const
 
 void exact_count_version_two(Graph *g, schedule_approx *s, const Schedule_IEP &schedule_iep, Pattern p) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
     // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
     int recur_depth = 50;
     int vertex_depth = 0;
 
-    int threshhold[recur_depth + 1] = {0};
+    uint32_t threshhold[recur_depth + 1] = {0};
     int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
     memset(record_degree, 0, sizeof(int) * g->v_cnt);
     for (int i = 0; i < g->v_cnt; i++) {
@@ -6077,416 +6158,16 @@ void exact_count_test(Graph *g, schedule_approx *s, const Schedule_IEP &schedule
     printf("exact_count %lld\n", global_ans);
 }
 
-void adaptive_ns(Graph *g, schedule_approx *s) {
-
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
-
-    // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
-    // 初始化阈值
-    // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
-    int recur_depth = 50;
-    int vertex_depth = 0;
-
-    int threshhold[recur_depth + 1] = {0};
-    int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
-    memset(record_degree, 0, sizeof(int) * g->v_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        record_degree[g->vertex[i + 1] - g->vertex[i]]++;
-    }
-    double ratio = 0;
-    double ratio_threshhold = 0.5;
-    double ratio_acum = 0.5;
-    // threshhold[0] = 1;
-    int iter_threshhoud = 1;
-    uint64_t iter_record = 0;
-    double change_ratio = 0.0;
-
-    while (iter_record < g->v_cnt) {
-        double temp_ratio = double(record_degree[iter_record]) / double(g->v_cnt);
-        ratio += temp_ratio;
-        iter_record++;
-        if (ratio > ratio_threshhold) {
-            threshhold[iter_threshhoud++] = iter_record;
-            // change_ratio = double(threshhold[iter_threshhoud - 1]) / double(threshhold[iter_threshhoud - 2]);
-            ratio_acum = ratio_acum * 0.5;
-            ratio_threshhold = ratio_threshhold + ratio_acum;
-            if (iter_threshhoud == recur_depth || iter_record > 20000 || iter_threshhoud > 16) { //|| change_ratio < 1.1
-                break;
-            }
-        }
-    }
-    for (int i = 1; i < recur_depth; i++)
-        if (threshhold[i] == 0 || (threshhold[i] - threshhold[i - 1] < 20 && i > 10)) {
-            recur_depth = i;
-            break;
-        }
-
-    threshhold[recur_depth] = g->v_cnt;
-    free(record_degree);
-
-    // 门槛有从0到recur_depth个，因此区间颜色有recur_depth种
-    uint32_t num_of_color = recur_depth;
-
-    // 查看阈值
-    // for (int i = 0; i < recur_depth; i++) {
-    //     printf("threshhold[%d] = %d\n", i, threshhold[i]);
-    // }
-
-    //==================================================================================================================================================//
-    //==================================================================================================================================================//
-    //==================================================================================================================================================//
-
-    // 过滤的数据结构。
-    filter filter_data;
-    filter_data.edge_project = (int64_t *)malloc(sizeof(int64_t) * g->e_cnt);
-    filter_data.edge_record = (int *)malloc(sizeof(int) * g->e_cnt);
-    memset(filter_data.edge_project, -1, sizeof(int64_t) * g->e_cnt);
-    memset(filter_data.edge_record, -1, sizeof(int) * g->e_cnt);
-    filter_data.degree = (uint32_t *)malloc(sizeof(uint32_t) * g->v_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        filter_data.degree[i] = g->vertex[i + 1] - g->vertex[i];
-    }
-
-    // 标记边
-    // 记录每种范围边数据的大小
-    uint64_t num_of_different_weight_of_edges[num_of_color] = {0};
-    for (uint64_t i = 0; i < g->v_cnt; ++i) {
-        if (filter_data.degree[i] >= s->order_degree[0]) {
-            for (uint64_t j = g->vertex[i]; j < g->vertex[i + 1]; ++j) {
-                uint32_t temp_degree = filter_data.degree[g->edge[j]];
-                if (temp_degree >= s->order_degree[1]) {
-                    int record_edge_color = find_range(threshhold, temp_degree, recur_depth + 1);
-                    filter_data.edge_record[j] = record_edge_color;
-                    num_of_different_weight_of_edges[record_edge_color]++;
-                }
-            }
-        }
-    }
-
-    // 投射边
-    // 前缀和形式
-    uint64_t prefix_sum_of_edges[recur_depth + 1] = {0};
-    for (int i = 1; i < recur_depth + 1; i++) {
-        prefix_sum_of_edges[i] = prefix_sum_of_edges[i - 1] + num_of_different_weight_of_edges[i - 1];
-    }
-    uint64_t weight_edge_ptr[recur_depth] = {0}; // 只用一次，将边按照其出端点的度数分类投射。
-    for (int i = 0; i < recur_depth; i++) {
-        weight_edge_ptr[i] = prefix_sum_of_edges[i];
-    }
-    for (uint32_t i = 0; i < g->e_cnt; ++i) {
-        if (filter_data.edge_record[i] != -1)
-            filter_data.edge_project[weight_edge_ptr[filter_data.edge_record[i]]++] = i;
-    }
-
-    // 记录采样结果
-    filter_data.sample_times_per_edge = (uint32_t *)malloc(sizeof(uint32_t) * g->e_cnt);
-    filter_data.sample_count_per_edge = (double *)malloc(sizeof(double) * g->e_cnt);
-    filter_data.sample_square_per_edge = (double *)malloc(sizeof(double) * g->e_cnt);
-    memset(filter_data.sample_times_per_edge, 0, sizeof(uint32_t) * g->e_cnt);
-    memset(filter_data.sample_count_per_edge, 0, sizeof(double) * g->e_cnt);
-    memset(filter_data.sample_square_per_edge, 0, sizeof(double) * g->e_cnt);
-
-    //==================================================================================================================================================//
-    //==================================================================================================================================================//
-    //==================================================================================================================================================//
-
-    // 采样批量
-    uint64_t batch_size = 1000;
-
-    // 随机数生成器
-    std::random_device rd;
-    std::default_random_engine gen(rd());
-
-    // 采样记录
-    uint64_t approx_sample_times = 0;
-    uint64_t real_sample_times = 0;
-    double approx_count = 0;
-    double approx_squra = 0;
-    bool flag[3] = {true, true, true};
-
-    // 主误差和局部误差
-    double var = 0.0;
-    double std_dev = 0.0;
-    double real_error = 1.0;
-
-    double var_local[recur_depth] = {0};
-    double std_dev_local[recur_depth] = {0};
-    double estimate_error_local[recur_depth] = {0};
-    uint64_t approx_sample_times_local[recur_depth] = {0};
-    double approx_count_local[recur_depth] = {0};
-    double approx_squra_local[recur_depth] = {0};
-    double real_error_gloabl = 0.0;
-
-    double real_average = 0.0;
-
-    uint32_t print_times = 0; // 输出次数
-
-    // 自适应分配范围
-    int num_of_threads = omp_get_max_threads();
-    uint64_t start_edge_id[num_of_threads] = {0};
-    uint64_t end_edge_id[num_of_threads];
-    for (int i = 0; i < num_of_threads; i++)
-        end_edge_id[i] = prefix_sum_of_edges[recur_depth];
-
-    double error_threshhold[10] = {0.0};
-    double var_threshhold[recur_depth] = {0.0};
-    double var_threshhold_pre[recur_depth] = {0.0};
-
-    // // 保证每条边只被处理依次
-    // int *record = (int *)malloc(sizeof(int) * g->e_cnt);
-    // memset(record, 0, sizeof(int) * g->e_cnt);
-
-    uint64_t global_sample_times;
-
-    bool record_flag[2] = {true, true};
-
-    // std::ofstream of;
-    // of.open("error_estimate_lj_4clique_adap.txt", std::ios::app);
-
-    // 误差 边界
-#pragma omp parallel
-    {
-// 可以使用master来实现
-#pragma omp master
-        {
-            while (real_error > 0.1 && approx_sample_times <= 100000000) {
-                // 更新采样区域
-                if (approx_sample_times > 1000 * print_times) {
-
-                    /* 局部误差 */
-                    // 记录平方和，计数和，局部采样次数
-                    for (int i = 0; i < recur_depth; i++) {
-                        approx_sample_times_local[i] = 0.0;
-                        approx_count_local[i] = 0.0;
-                        approx_squra_local[i] = 0.0;
-                    }
-                    for (int i = 0; i < recur_depth; i++) {
-                        for (int ptr = prefix_sum_of_edges[i]; ptr < prefix_sum_of_edges[i + 1]; ptr++) {
-                            auto eid = filter_data.edge_project[ptr];
-                            approx_sample_times_local[i] += filter_data.sample_times_per_edge[eid];
-                            approx_count_local[i] += filter_data.sample_count_per_edge[eid];
-                            approx_squra_local[i] += filter_data.sample_square_per_edge[eid];
-                        }
-                    }
-                    // 局部均值的偏差
-                    for (int i = 0; i < recur_depth; i++) {
-                        var_local[i] = (double)(approx_squra_local[i] / approx_sample_times_local[i] -
-                                                std::pow((approx_count_local[i] / approx_sample_times_local[i]), 2));
-                        // std_dev_local[i] = std::sqrt(var_local[i] / approx_sample_times_local[i]);
-                        // estimate_error_local[i] = std_dev_local[i] * 2.576 / (approx_count_local[i] / approx_sample_times_local[i]); // 99%的信心
-                    }
-
-                    // 局部总和的标准偏差
-                    // for (int i = 0; i < recur_depth; i++) {
-                    //     double cur_errror = std::sqrt(var_local[i] / approx_sample_times_local[i]) * num_of_different_weight_of_edges[i];
-                    //     std::cout << " 线程" << i << "偏差 " << cur_errror << std::endl;
-                    // }
-
-                    /* 统计误差 */
-                    // 采样总数
-                    global_sample_times = 0;
-                    for (int i = 0; i < recur_depth; i++) {
-                        global_sample_times += approx_sample_times_local[i];
-                    }
-                    // 总体方差等于局部方差除以采样次数之和， 总体均值为局部均值之和
-                    var = 0.0;
-                    real_average = 0.0;
-                    for (int i = 0; i < recur_depth; i++) {
-                        var +=
-                            (var_local[i] * num_of_different_weight_of_edges[i] * num_of_different_weight_of_edges[i]) / approx_sample_times_local[i];
-                        real_average += (approx_count_local[i] / approx_sample_times_local[i] * num_of_different_weight_of_edges[i]);
-                    }
-                    std_dev = std::sqrt(var);
-                    real_error = std_dev * 2.576 / real_average; // 99%的信心
-
-                    // if (approx_sample_times > 1000 && record_flag[0]) {
-                    //     std::ofstream of;
-                    //     of.open("partition_state.txt", std::ios::app);
-                    //     of << approx_sample_times << std::endl;
-                    //     for (int i = 0; i < recur_depth; i++) { // 不乘以区域大小就是区域均值的偏差，加上区域大小相当于加权
-                    //         of << std::sqrt(var_local[i] / approx_sample_times_local[i]) * num_of_different_weight_of_edges[i] /
-                    //                   (approx_count_local[i] / approx_sample_times_local[i])
-                    //            << "   ";
-                    //     }
-                    //     of << std::endl;
-                    //     record_flag[0] = false;
-                    //     of.close();
-                    // }
-                    // if (approx_sample_times > 1000000 && record_flag[1]) {
-                    //     std::ofstream of;
-                    //     of.open("partition_state.txt", std::ios::app);
-                    //     of << approx_sample_times << std::endl;
-                    //     for (int i = 0; i < recur_depth; i++) {
-                    //         of << std::sqrt(var_local[i] / approx_sample_times_local[i]) * num_of_different_weight_of_edges[i] /
-                    //                   (approx_count_local[i] / approx_sample_times_local[i])
-                    //            << "   ";
-                    //     }
-                    //     of << std::endl;
-                    //     record_flag[1] = false;
-                    //     of.close();
-                    // }
-
-                    // double realreal_error = (real_average - (5216918441.0 * 24.0)) / (5216918441.0 * 24.0); // sk 4clique
-                    // printf("approx_count: %lf, realreal_error: %lf, real_error: %lf\n", real_average, realreal_error, real_error);
-                    // of << approx_sample_times << "  " << realreal_error << "  " << real_error << std::endl;
-
-                    if (flag[0] && real_error < 0.1) {
-                        printf("approx_count: %lf, approx_sample_times: %lu, real_error: %lf\n", real_average, global_sample_times, real_error);
-                        flag[0] = false;
-                    }
-                    if (flag[1] && real_error < 0.05) {
-                        printf("approx_count: %lf, approx_sample_times: %lu, real_error: %lf\n", real_average, global_sample_times, real_error);
-                        flag[1] = false;
-                    }
-                    print_times++;
-
-                    /* 自适应的修改采样范围 */
-                    // 记录 偏差阈值 迭代上升。
-                    for (int i = 0; i < recur_depth; i++) {
-                        var_threshhold[i] = std::sqrt(var_local[i] / approx_sample_times_local[i]) * num_of_different_weight_of_edges[i] /
-                                            (approx_count_local[i] / approx_sample_times_local[i]);
-                        var_threshhold_pre[i] = var_threshhold[i];
-                    }
-                    std::sort(var_threshhold, var_threshhold + recur_depth);
-                    // for (int i = 0; i < 5; i++) {
-                    //     int var_threshhold_index = recur_depth - std::pow(2, (i + 1)) + 1;
-                    //     if (var_threshhold_index >= 0)
-                    //         error_threshhold[i] = var_threshhold[var_threshhold_index] - 1;
-                    // }
-                    // 取大小为前十的边界
-                    for (int i = 0; i < 10; i++) {
-                        int var_threshhold_index = recur_depth - 1 - i;
-                        if (var_threshhold_index >= 0)
-                            error_threshhold[i] = var_threshhold[var_threshhold_index] - 1;
-                    }
-
-                    int remain_thread = num_of_threads;
-                    int allocate_thread_ptr = 0;
-                    int allocate_thread = 0;
-                    int allocate_threshhold = 0;
-                    int adaptive_start = 0;
-                    while (remain_thread > num_of_threads / 2) {
-                        allocate_thread = remain_thread / 4;
-                        // 查找当前应该分配的阈值的下标。
-                        for (int i = 0; i < recur_depth; i++) {
-                            if (var_threshhold_pre[i] > error_threshhold[allocate_threshhold]) {
-                                adaptive_start = i;
-                            }
-                        }
-                        allocate_threshhold++;
-                        for (int i = allocate_thread_ptr; i < allocate_thread_ptr + allocate_thread; i++) {
-                            start_edge_id[i] = prefix_sum_of_edges[adaptive_start];
-                            // end_edge_id[i] = prefix_sum_of_edges[adaptive_start + 1];
-                        }
-                        remain_thread -= allocate_thread;
-                        allocate_thread_ptr += allocate_thread;
-                    }
-                    for (int i = allocate_thread_ptr; i < num_of_threads; i++) {
-                        end_edge_id[i] = prefix_sum_of_edges[recur_depth];
-                    }
-
-                    // int remain_thread = num_of_threads;
-                    // int allocate_thread_ptr = 0;
-                    // int allocate_threshhold = 0;
-                    // int adaptive_start = 0;
-                    // int allocate_thread = 0;
-
-                    // // 最重的
-                    // allocate_thread_ptr = remain_thread / 4;
-                    // remain_thread -= allocate_thread_ptr;
-                    // for (int i = 0; i < recur_depth; i++) {
-                    //     if (var_threshhold_pre[i] > error_threshhold[0]) {
-                    //         adaptive_start = i;
-                    //     }
-                    // }
-                    // for (int i = 0; i < allocate_thread_ptr; i++) {
-                    //     start_edge_id[i] = prefix_sum_of_edges[adaptive_start];
-                    //     end_edge_id[i] = prefix_sum_of_edges[adaptive_start + 1];
-                    // }
-
-                    // // 次重的线程依次分配两个线程
-                    // for (int i = 0; i < recur_depth; i++) {
-                    //     if (var_threshhold_pre[i] > error_threshhold[5] && var_threshhold_pre[i] < error_threshhold[0]) {
-                    //         start_edge_id[allocate_thread_ptr] = prefix_sum_of_edges[i];
-                    //         end_edge_id[allocate_thread_ptr] = prefix_sum_of_edges[i + 1];
-                    //         start_edge_id[allocate_thread_ptr + 1] = prefix_sum_of_edges[i];
-                    //         end_edge_id[allocate_thread_ptr + 1] = prefix_sum_of_edges[i + 1];
-                    //         allocate_thread_ptr += 2;
-                    //         if (num_of_threads - allocate_thread_ptr <= num_of_threads / 4) {
-                    //             break;
-                    //         }
-                    //     }
-                    // }
-                    // // 再轻的线程分配一个线程
-                    // if (num_of_threads - allocate_thread_ptr > num_of_threads / 4) {
-                    //     for (int i = 0; i < recur_depth; i++) {
-                    //         if (var_threshhold_pre[i] > error_threshhold[10] && var_threshhold_pre[i] < error_threshhold[5]) {
-                    //             start_edge_id[allocate_thread_ptr] = prefix_sum_of_edges[i];
-                    //             end_edge_id[allocate_thread_ptr] = prefix_sum_of_edges[i + 1];
-                    //             allocate_thread_ptr += 1;
-                    //             if (num_of_threads - allocate_thread_ptr < num_of_threads / 4) {
-                    //                 break;
-                    //             }
-                    //         }
-                    //     }
-                    // }
-
-                    // 剩余的线程处理全局
-                }
-            }
-            if (flag[2] && real_error <= 0.01) {
-                printf("approx_count: %lf, approx_sample_times: %lu, real_error: %lf\n", real_average, global_sample_times, real_error);
-                flag[2] = false;
-            }
-        }
-        if (omp_get_thread_num()) {
-            while (real_error > 0.1 && approx_sample_times <= 100000000) {
-                int cur_thread = omp_get_thread_num();
-                // 如果需要精确计算
-                std::uniform_int_distribution<uint64_t> dist(start_edge_id[cur_thread],
-                                                             end_edge_id[cur_thread] - 1); //***采样范围的更新可以不需要原子操作
-                for (uint64_t i = 0; i < batch_size; i++) {
-                    auto random_id = dist(gen);
-                    auto eid = filter_data.edge_project[random_id]; // 一开始就处理最后一个区间，但是会不断过滤
-                    pattern_sample_ns_record(eid, g, s, &filter_data);
-                }
-
-#pragma omp atomic
-                approx_sample_times += batch_size;
-            }
-        }
-    }
-
-    // of.close();
-
-    free(filter_data.edge_project);
-    free(filter_data.edge_record);
-    free(filter_data.degree);
-    free(filter_data.sample_count_per_edge);
-    free(filter_data.sample_times_per_edge);
-    free(filter_data.sample_square_per_edge);
-}
-
 void approximate_exact_fusion_eightyseven(Graph *g, schedule_approx *s, const Schedule_IEP &schedule_iep, Pattern p) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
     // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
     int recur_depth = 50;
     int vertex_depth = 0;
 
-    int threshhold[recur_depth + 1] = {0};
+    uint32_t threshhold[recur_depth + 1] = {0};
     int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
     memset(record_degree, 0, sizeof(int) * g->v_cnt);
     for (int i = 0; i < g->v_cnt; i++) {
@@ -6936,27 +6617,16 @@ void approximate_exact_fusion_eightyseven(Graph *g, schedule_approx *s, const Sc
     free(filter_data.delete_edge);
 }
 
-void partition_ns(Graph *g, schedule_approx *s) {
+// 阈值划分
+void threshhold_compute(Graph *g, uint32_t threshhold[], int &recur_depth) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
-
-    // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
-    // 初始化阈值
-    // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
-    int recur_depth = 50;
-    int vertex_depth = 0;
-
-    int threshhold[recur_depth + 1] = {0};
+    // 记录每种度数的顶点数量
     int *record_degree = (int *)malloc(sizeof(int) * g->v_cnt);
     memset(record_degree, 0, sizeof(int) * g->v_cnt);
     for (int i = 0; i < g->v_cnt; i++) {
         record_degree[g->vertex[i + 1] - g->vertex[i]]++;
     }
+
     double ratio = 0;
     double ratio_threshhold = 0.5;
     double ratio_acum = 0.5;
@@ -6965,7 +6635,10 @@ void partition_ns(Graph *g, schedule_approx *s) {
     uint64_t iter_record = 0;
     double change_ratio = 0.0;
 
+    // 处理每一种度数的顶点，而不是每一个顶点
     while (iter_record < g->v_cnt) {
+
+        // 当前种类的顶点战整体的比值
         double temp_ratio = double(record_degree[iter_record]) / double(g->v_cnt);
         ratio += temp_ratio;
         iter_record++;
@@ -6985,70 +6658,27 @@ void partition_ns(Graph *g, schedule_approx *s) {
             break;
         }
 
+    // 阈值里面记录的是顶点的度数
     threshhold[recur_depth] = g->v_cnt;
     free(record_degree);
+}
 
-    // 门槛有从0到recur_depth个，因此区间颜色有recur_depth种
-    uint32_t num_of_color = recur_depth;
+void adaptive_ns(Graph *g, schedule_approx *s) {
 
-    // 查看阈值
-    // for (int i = 0; i < recur_depth; i++) {
-    //     printf("threshhold[%d] = %d\n", i, threshhold[i]);
-    // }
+    edge_from_init(g);
 
-    //==================================================================================================================================================//
-    //==================================================================================================================================================//
-    //==================================================================================================================================================//
+    // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
+    // 初始化阈值
+    // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
+    int recur_depth = 50;
+    // 划分的阈值记录
+    uint32_t threshhold[recur_depth + 1] = {0};
+    threshhold_compute(g, threshhold, recur_depth);
 
-    // 过滤的数据结构。
+    // 过滤数据的初始化
     filter filter_data;
-    filter_data.edge_project = (int64_t *)malloc(sizeof(int64_t) * g->e_cnt);
-    filter_data.edge_record = (int *)malloc(sizeof(int) * g->e_cnt);
-    memset(filter_data.edge_project, -1, sizeof(int64_t) * g->e_cnt);
-    memset(filter_data.edge_record, -1, sizeof(int) * g->e_cnt);
-    filter_data.degree = (uint32_t *)malloc(sizeof(uint32_t) * g->v_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        filter_data.degree[i] = g->vertex[i + 1] - g->vertex[i];
-    }
-
-    // 标记边
-    // 记录每种范围边数据的大小
-    uint64_t num_of_different_weight_of_edges[num_of_color] = {0};
-    for (uint64_t i = 0; i < g->v_cnt; ++i) {
-        if (filter_data.degree[i] >= s->order_degree[0]) {
-            for (uint64_t j = g->vertex[i]; j < g->vertex[i + 1]; ++j) {
-                uint32_t temp_degree = filter_data.degree[g->edge[j]];
-                if (temp_degree >= s->order_degree[1]) {
-                    int record_edge_color = find_range(threshhold, temp_degree, recur_depth + 1);
-                    filter_data.edge_record[j] = record_edge_color;
-                    num_of_different_weight_of_edges[record_edge_color]++;
-                }
-            }
-        }
-    }
-
-    // 投射边
-    // 前缀和形式
-    uint64_t prefix_sum_of_edges[recur_depth + 1] = {0};
-    for (int i = 1; i < recur_depth + 1; i++) {
-        prefix_sum_of_edges[i] = prefix_sum_of_edges[i - 1] + num_of_different_weight_of_edges[i - 1];
-    }
-    uint64_t weight_edge_ptr[recur_depth] = {0}; // 只用一次，将边按照其出端点的度数分类投射。
-    for (int i = 0; i < recur_depth; i++) {
-        weight_edge_ptr[i] = prefix_sum_of_edges[i];
-    }
-    for (uint32_t i = 0; i < g->e_cnt; ++i) {
-        if (filter_data.edge_record[i] != -1)
-            filter_data.edge_project[weight_edge_ptr[filter_data.edge_record[i]]++] = i;
-    }
-
-    // 记录采样结果
-    filter_data.sample_times_per_edge = (uint32_t *)malloc(sizeof(uint32_t) * g->e_cnt);
-    filter_data.sample_count_per_edge = (double *)malloc(sizeof(double) * g->e_cnt);
-    filter_data.sample_square_per_edge = (double *)malloc(sizeof(double) * g->e_cnt);
-    memset(filter_data.sample_times_per_edge, 0, sizeof(uint32_t) * g->e_cnt);
-    memset(filter_data.sample_count_per_edge, 0, sizeof(double) * g->e_cnt);
-    memset(filter_data.sample_square_per_edge, 0, sizeof(double) * g->e_cnt);
+    filter_data.num_of_color = recur_depth;
+    filter_init(&filter_data, g, s, threshhold);
 
     //==================================================================================================================================================//
     //==================================================================================================================================================//
@@ -7086,112 +6716,71 @@ void partition_ns(Graph *g, schedule_approx *s) {
     uint32_t print_times = 0; // 输出次数
 
     // 自适应分配范围
-    int num_of_threads = omp_get_max_threads();
-    uint64_t start_edge_id[num_of_threads] = {0};
-    uint64_t end_edge_id[num_of_threads];
-    for (int i = 0; i < num_of_threads; i++)
-        end_edge_id[i] = prefix_sum_of_edges[recur_depth];
+    uint64_t start_edge_id[filter_data.num_of_thread] = {0};
+    uint64_t end_edge_id[filter_data.num_of_thread];
+    for (int i = 0; i < filter_data.num_of_thread; i++)
+        end_edge_id[i] = filter_data.prefix_sum_of_edges[recur_depth];
 
     double error_threshhold[10] = {0.0};
     double var_threshhold[recur_depth] = {0.0};
     double var_threshhold_pre[recur_depth] = {0.0};
 
-    uint64_t global_sample_times;
-
     // // 保证每条边只被处理依次
     // int *record = (int *)malloc(sizeof(int) * g->e_cnt);
     // memset(record, 0, sizeof(int) * g->e_cnt);
 
-    bool record_flag[2] = {true, true};
+    uint64_t global_sample_times;
 
-    std::ofstream of;
-    of.open("error_estimate_sk_4clique.txt", std::ios::app);
+    bool record_flag[2] = {true, true};
 
     // 误差 边界
 #pragma omp parallel
     {
-// 可以使用master来实现
+        // 可以使用master来实现
+        while (real_error > 0.01 && approx_sample_times <= g->e_cnt * 10) {
 #pragma omp master
-        {
-            while (real_error > 0.01 && approx_sample_times <= 100000000) {
-
+            {
                 // 更新采样区域
                 if (approx_sample_times > 1000 * print_times) {
 
                     /* 局部误差 */
-                    // 记录平方和，计数和，局部采样次数
-                    for (int i = 0; i < recur_depth; i++) {
-                        approx_sample_times_local[i] = 0.0;
-                        approx_count_local[i] = 0.0;
-                        approx_squra_local[i] = 0.0;
+                    // 统计每个分区的估计数据，从每个线程采样数据中收集。
+                    for (uint32_t i = 0; i < filter_data.num_of_color; i++) {
+                        filter_data.sample_times_per_region[0][i] = 0;
+                        filter_data.sample_count_per_region[0][i] = 0;
+                        filter_data.sample_square_per_region[0][i] = 0;
                     }
-                    for (int i = 0; i < recur_depth; i++) {
-                        for (int ptr = prefix_sum_of_edges[i]; ptr < prefix_sum_of_edges[i + 1]; ptr++) {
-                            auto eid = filter_data.edge_project[ptr];
-                            approx_sample_times_local[i] += filter_data.sample_times_per_edge[eid];
-                            approx_count_local[i] += filter_data.sample_count_per_edge[eid];
-                            approx_squra_local[i] += filter_data.sample_square_per_edge[eid];
+                    for (int i = 1; i < filter_data.num_of_thread; i++) {
+                        for (uint32_t j = 0; j < filter_data.num_of_color; j++) {
+                            filter_data.sample_times_per_region[0][j] += filter_data.sample_times_per_region[i][j];
+                            filter_data.sample_count_per_region[0][j] += filter_data.sample_count_per_region[i][j];
+                            filter_data.sample_square_per_region[0][j] += filter_data.sample_square_per_region[i][j];
                         }
                     }
-                    // 局部均值的偏差
-                    for (int i = 0; i < recur_depth; i++) {
-                        var_local[i] = (double)(approx_squra_local[i] / approx_sample_times_local[i] -
-                                                std::pow((approx_count_local[i] / approx_sample_times_local[i]), 2)) *
-                                       std::pow(num_of_different_weight_of_edges[i], 2) / approx_sample_times_local[i];
-                        // std_dev_local[i] = std::sqrt(var_local[i] / approx_sample_times_local[i]);
-                        // estimate_error_local[i] = std_dev_local[i] * 2.576 / (approx_count_local[i] / approx_sample_times_local[i]); // 99%的信心
+
+                    // 局部方差对于全局影响的计算
+                    for (uint32_t i = 0; i < filter_data.num_of_color; i++) {
+                        var_local[i] =
+                            (double)(filter_data.sample_square_per_region[0][i] / filter_data.sample_times_per_region[0][i] -
+                                     std::pow((filter_data.sample_count_per_region[0][i] / filter_data.sample_times_per_region[0][i]), 2)) *
+                            std::pow(filter_data.num_of_different_weight_of_edges[i], 2) / filter_data.sample_times_per_region[0][i];
                     }
 
-                    // 局部总和的标准偏差
-                    // for (int i = 0; i < recur_depth; i++) {
-                    //     double cur_errror = std::sqrt(var_local[i] / approx_sample_times_local[i]) * num_of_different_weight_of_edges[i];
-                    //     std::cout << " 线程" << i << "偏差 " << cur_errror << std::endl;
-                    // }
-
-                    // if (approx_sample_times > 1000 && record_flag[0]) {
-                    //     std::ofstream of;
-                    //     of.open("partition_state.txt", std::ios::app);
-                    //     of << approx_sample_times << std::endl;
-                    //     for (int i = 0; i < recur_depth; i++) {
-                    //         of << std::sqrt(var_local[i]) / (approx_count_local[i] / approx_sample_times_local[i]) << "   ";
-                    //     }
-                    //     of << std::endl;
-                    //     record_flag[0] = false;
-                    //     of.close();
-                    // }
-                    // if (approx_sample_times > 1000000 && record_flag[1]) {
-                    //     std::ofstream of;
-                    //     of.open("partition_state.txt", std::ios::app);
-                    //     of << approx_sample_times << std::endl;
-                    //     for (int i = 0; i < recur_depth; i++) {
-                    //         of << std::sqrt(var_local[i]) / (approx_count_local[i] / approx_sample_times_local[i]) << "   ";
-                    //     }
-                    //     of << std::endl;
-                    //     record_flag[1] = false;
-                    //     of.close();
-                    // }
-
                     /* 统计误差 */
-                    // 采样总数
-                    // global_sample_times = 0;
-                    // for (int i = 0; i < recur_depth; i++) {
-                    //     global_sample_times += approx_sample_times_local[i];
-                    // }
                     // 总体方差等于局部方差除以采样次数之和， 总体均值为局部均值之和
                     var = 0.0;
                     real_average = 0.0;
-                    for (int i = 0; i < recur_depth; i++) {
+                    for (int i = 0; i < filter_data.num_of_color; i++) {
                         var += var_local[i];
-                        real_average += (approx_count_local[i] / approx_sample_times_local[i] * num_of_different_weight_of_edges[i]);
+                        real_average += (filter_data.sample_count_per_region[0][i] / filter_data.sample_times_per_region[0][i] *
+                                         filter_data.num_of_different_weight_of_edges[i]);
                     }
                     std_dev = std::sqrt(var);
                     real_error = std_dev * 2.576 / real_average; // 99%的信心
 
-                    double realreal_error = (real_average - (148834439.0 * 24.0)) / (148834439.0 * 24.0); // pt 4cycle
-
-                    printf("approx_sample_times: %lu, real_error: %lf, estimate_error: %lf\n", approx_sample_times, realreal_error, real_error);
-
-                    of << approx_sample_times << "  " << realreal_error << "  " << real_error << std::endl;
+                    if (std::isnan(real_error)) {
+                        real_error = 1.0;
+                    }
 
                     if (flag[0] && real_error < 0.1) {
                         printf("approx_count: %lf, approx_sample_times: %lu, real_error: %lf\n", real_average, approx_sample_times, real_error);
@@ -7205,55 +6794,48 @@ void partition_ns(Graph *g, schedule_approx *s) {
 
                     /* 自适应的修改采样范围 */
                     // 记录 偏差阈值 迭代上升。
-                    // for (int i = 0; i < recur_depth; i++) {
-                    //     var_threshhold[i] = std::sqrt(var_local[i] / approx_sample_times_local[i]) * num_of_different_weight_of_edges[i] /
-                    //                         (approx_count_local[i] / approx_sample_times_local[i]);
-                    //     var_threshhold_pre[i] = var_threshhold[i];
-                    // }
-                    // std::sort(var_threshhold, var_threshhold + recur_depth);
-                    // // for (int i = 0; i < 5; i++) {
-                    // //     int var_threshhold_index = recur_depth - std::pow(2, (i + 1)) + 1;
-                    // //     if (var_threshhold_index >= 0)
-                    // //         error_threshhold[i] = var_threshhold[var_threshhold_index] - 1;
-                    // // }
-                    // // 取大小为前十的边界
-                    // for (int i = 0; i < 10; i++) {
-                    //     int var_threshhold_index = recur_depth - 1 - i;
-                    //     if (var_threshhold_index >= 0)
-                    //         error_threshhold[i] = var_threshhold[var_threshhold_index] - 1;
-                    // }
+                    for (int i = 0; i < recur_depth; i++) {
+                        var_threshhold[i] = std::sqrt(var_local[i] / approx_sample_times_local[i]) * filter_data.num_of_different_weight_of_edges[i] /
+                                            (approx_count_local[i] / approx_sample_times_local[i]);
+                        var_threshhold_pre[i] = var_threshhold[i];
+                    }
+                    std::sort(var_threshhold, var_threshhold + recur_depth);
 
-                    // int remain_thread = num_of_threads;
-                    // int allocate_thread_ptr = 0;
-                    // int allocate_threshhold = 0;
-                    // int adaptive_start = 0;
-                    // while (remain_thread > 2) {
-                    //     int allocate_thread = remain_thread / 2;
-                    //     // 查找当前应该分配的阈值的下标。
-                    //     for (int i = 0; i < recur_depth; i++) {
-                    //         if (var_threshhold_pre[i] > error_threshhold[allocate_threshhold]) {
-                    //             adaptive_start = i;
-                    //         }
-                    //     }
-                    //     allocate_threshhold++;
-                    //     for (int i = allocate_thread_ptr; i < allocate_thread_ptr + allocate_thread; i++) {
-                    //         start_edge_id[i] = prefix_sum_of_edges[adaptive_start];
-                    //         end_edge_id[i] = prefix_sum_of_edges[adaptive_start + 1];
-                    //     }
-                    //     remain_thread -= allocate_thread;
-                    //     allocate_thread_ptr += allocate_thread;
-                    // }
-                    // end_edge_id[num_of_threads - 1] = prefix_sum_of_edges[recur_depth];
-                    // end_edge_id[num_of_threads - 2] = prefix_sum_of_edges[recur_depth];
+                    // 取大小为前十的边界
+                    for (int i = 0; i < 10; i++) {
+                        int var_threshhold_index = recur_depth - 1 - i;
+                        if (var_threshhold_index >= 0)
+                            error_threshhold[i] = var_threshhold[var_threshhold_index] - 1;
+                    }
+
+                    int remain_thread = filter_data.num_of_thread;
+                    int allocate_thread_ptr = 0;
+                    int allocate_thread = 0;
+                    int allocate_threshhold = 0;
+                    int adaptive_start = 0;
+                    while (remain_thread > filter_data.num_of_thread / 2) {
+                        allocate_thread = remain_thread / 4;
+                        // 查找当前应该分配的阈值的下标。
+                        for (int i = 0; i < recur_depth; i++) {
+                            if (var_threshhold_pre[i] > error_threshhold[allocate_threshhold]) {
+                                adaptive_start = i;
+                            }
+                        }
+                        allocate_threshhold++;
+                        for (int i = allocate_thread_ptr; i < allocate_thread_ptr + allocate_thread; i++) {
+                            start_edge_id[i] = filter_data.prefix_sum_of_edges[adaptive_start];
+                            // end_edge_id[i] = prefix_sum_of_edges[adaptive_start + 1];
+                        }
+                        remain_thread -= allocate_thread;
+                        allocate_thread_ptr += allocate_thread;
+                    }
+                    for (int i = allocate_thread_ptr; i < filter_data.num_of_thread; i++) {
+                        end_edge_id[i] = filter_data.prefix_sum_of_edges[recur_depth];
+                    }
                 }
             }
-            if (flag[2] && real_error <= 0.01) {
-                printf("approx_count: %lf, global_sample_times: %lu, real_error: %lf\n", real_average, approx_sample_times, real_error);
-                flag[2] = false;
-            }
-        }
-        if (omp_get_thread_num()) {
-            while (real_error > 0.01 && approx_sample_times <= 100000000) {
+
+            if (omp_get_thread_num()) {
                 int cur_thread = omp_get_thread_num();
                 // 如果需要精确计算
                 std::uniform_int_distribution<uint64_t> dist(start_edge_id[cur_thread],
@@ -7261,7 +6843,9 @@ void partition_ns(Graph *g, schedule_approx *s) {
                 for (uint64_t i = 0; i < batch_size; i++) {
                     auto random_id = dist(gen);
                     auto eid = filter_data.edge_project[random_id]; // 一开始就处理最后一个区间，但是会不断过滤
-                    pattern_sample_ns_record(eid, g, s, &filter_data);
+                                                                    // pattern_sample_ns_record(eid, g, s, &filter_data);
+                                                                    // pattern_sample_ns_record_filter(eid, g, s, &filter_data);
+                    pattern_sample_ns_record_filter_region(eid, g, s, &filter_data, cur_thread, threshhold);
                 }
 
 #pragma omp atomic
@@ -7269,25 +6853,157 @@ void partition_ns(Graph *g, schedule_approx *s) {
             }
         }
     }
+    if (flag[2] && real_error <= 0.01) {
+        printf("approx_count: %lf, approx_sample_times: %lu, real_error: %lf\n", real_average, approx_sample_times, real_error);
+        flag[2] = false;
+    }
 
-    of.close();
+    free_filter_data(filter_data);
+}
 
-    free(filter_data.edge_project);
-    free(filter_data.edge_record);
-    free(filter_data.degree);
-    free(filter_data.sample_count_per_edge);
-    free(filter_data.sample_times_per_edge);
-    free(filter_data.sample_square_per_edge);
+void partition_ns(Graph *g, schedule_approx *s) {
+
+    edge_from_init(g);
+    // 平均度数  frendster 28 twitter 35 livejouranl 17 youtube 2 patent 5 pokec 30 tp 28 sk 11
+    // 初始化阈值
+    // 阈值划分10次 只保留千分之一的顶点 结果波动还很大，
+
+    // 阈值计算
+    // 递归划分的最大轮次
+    int recur_depth = 50;
+    // 划分的阈值记录
+    uint32_t threshhold[recur_depth + 1] = {0};
+    threshhold_compute(g, threshhold, recur_depth);
+
+    // 过滤数据的初始化
+    filter filter_data;
+    filter_data.num_of_color = recur_depth;
+    filter_init(&filter_data, g, s, threshhold);
+
+    // 采样批量
+    uint64_t batch_size = 1000;
+
+    // 随机数生成器
+    std::random_device rd;
+    std::default_random_engine gen(rd());
+
+    // 采样记录
+    uint64_t approx_sample_times = 0;
+    uint64_t real_sample_times = 0;
+    double approx_count = 0;
+    double approx_squra = 0;
+    bool flag[3] = {true, true, true};
+    uint32_t print_times = 0; // 输出次数
+
+    // 主误差和局部误差
+    double var = 0.0;
+    double std_dev = 0.0;
+    double real_error = 1.0;
+
+    double var_local[recur_depth] = {0};
+    double std_dev_local[recur_depth] = {0};
+    double estimate_error_local[recur_depth] = {0};
+    uint64_t approx_sample_times_local[recur_depth] = {0};
+    double approx_count_local[recur_depth] = {0};
+    double approx_squra_local[recur_depth] = {0};
+    double real_error_gloabl = 0.0;
+    double real_average = 0.0;
+
+    // 自适应分配范围
+    uint64_t start_edge_id[filter_data.num_of_thread] = {0};
+    uint64_t end_edge_id[filter_data.num_of_thread];
+    for (int i = 0; i < filter_data.num_of_thread; i++)
+        end_edge_id[i] = filter_data.prefix_sum_of_edges[recur_depth];
+
+#pragma omp parallel
+    {
+
+        while (real_error > 0.01 && approx_sample_times <= g->e_cnt * 10) {
+// 可以使用master来实现
+#pragma omp master
+            {
+                // 更新采样区域
+                if (approx_sample_times > 1000 * print_times) {
+
+                    /* 局部误差 */
+                    // 统计每个分区的估计数据，从每个线程采样数据中收集。
+                    for (uint32_t i = 0; i < filter_data.num_of_color; i++) {
+                        filter_data.sample_times_per_region[0][i] = 0;
+                        filter_data.sample_count_per_region[0][i] = 0;
+                        filter_data.sample_square_per_region[0][i] = 0;
+                    }
+                    for (int i = 1; i < filter_data.num_of_thread; i++) {
+                        for (uint32_t j = 0; j < filter_data.num_of_color; j++) {
+                            filter_data.sample_times_per_region[0][j] += filter_data.sample_times_per_region[i][j];
+                            filter_data.sample_count_per_region[0][j] += filter_data.sample_count_per_region[i][j];
+                            filter_data.sample_square_per_region[0][j] += filter_data.sample_square_per_region[i][j];
+                        }
+                    }
+
+                    // 局部方差对于全局影响的计算
+                    for (uint32_t i = 0; i < filter_data.num_of_color; i++) {
+                        var_local[i] =
+                            (double)(filter_data.sample_square_per_region[0][i] / filter_data.sample_times_per_region[0][i] -
+                                     std::pow((filter_data.sample_count_per_region[0][i] / filter_data.sample_times_per_region[0][i]), 2)) *
+                            std::pow(filter_data.num_of_different_weight_of_edges[i], 2) / filter_data.sample_times_per_region[0][i];
+                    }
+
+                    /* 统计误差 */
+                    // 总体方差等于局部方差除以采样次数之和， 总体均值为局部均值之和
+                    var = 0.0;
+                    real_average = 0.0;
+                    for (int i = 0; i < filter_data.num_of_color; i++) {
+                        var += var_local[i];
+                        real_average += (filter_data.sample_count_per_region[0][i] / filter_data.sample_times_per_region[0][i] *
+                                         filter_data.num_of_different_weight_of_edges[i]);
+                    }
+                    std_dev = std::sqrt(var);
+                    real_error = std_dev * 2.576 / real_average; // 99%的信心
+
+                    if (std::isnan(real_error)) {
+                        real_error = 1.0;
+                    }
+
+                    if (flag[0] && real_error < 0.1) {
+                        printf("approx_count: %lf, approx_sample_times: %lu, real_error: %lf\n", real_average, approx_sample_times, real_error);
+                        flag[0] = false;
+                    }
+                    if (flag[1] && real_error < 0.05) {
+                        printf("approx_count: %lf, approx_sample_times: %lu, real_error: %lf\n", real_average, approx_sample_times, real_error);
+                        flag[1] = false;
+                    }
+                    print_times++;
+                }
+            }
+
+            if (omp_get_thread_num()) {
+                int cur_thread = omp_get_thread_num();
+                // 如果需要精确计算
+                std::uniform_int_distribution<uint64_t> dist(start_edge_id[cur_thread],
+                                                             end_edge_id[cur_thread] - 1); //***采样范围的更新可以不需要原子操作
+                for (uint64_t i = 0; i < batch_size; i++) {
+                    auto random_id = dist(gen);
+                    auto eid = filter_data.edge_project[random_id]; // 一开始就处理最后一个区间，但是会不断过滤
+                                                                    // pattern_sample_ns_record(eid, g, s, &filter_data);
+                                                                    // pattern_sample_ns_record_filter(eid, g, s, &filter_data);
+                    pattern_sample_ns_record_filter_region(eid, g, s, &filter_data, cur_thread, threshhold);
+                }
+#pragma omp atomic
+                approx_sample_times += batch_size;
+            }
+        }
+    }
+    if (flag[2] && real_error <= 0.01) {
+        printf("approx_count: %lf, global_sample_times: %lu, real_error: %lf\n", real_average, approx_sample_times, real_error);
+        flag[2] = false;
+    }
+
+    free_filter_data(filter_data);
 }
 
 void scale_gpm_ns(Graph *g, schedule_approx *s) {
 
-    g->edge_from = (v_index_t *)malloc(sizeof(v_index_t) * g->e_cnt);
-    for (int i = 0; i < g->v_cnt; i++) {
-        for (int j = g->vertex[i]; j < g->vertex[i + 1]; j++) {
-            g->edge_from[j] = i;
-        }
-    }
+    edge_from_init(g);
 
     // 采样批量
     uint64_t batch_size = 1000;
@@ -7436,12 +7152,12 @@ int main(int argc, char *argv[]) {
     // pattern_count_ns_mpi_fix_error_filter_vertex_after_sample(g, &schedule, schedule_iep, pattern);
     // exact_count_test(g, &schedule, schedule_iep, pattern);
     // exact_count_version_two(g, &schedule, schedule_iep, pattern);
-    // adaptive_approximate_exact_fusion(g, &schedule, schedule_iep, pattern);
 
     // approximate_exact_fusion_fifty(g, &schedule, schedule_iep, pattern);
     // approximate_exact_fusion_seventyfive(g, &schedule, schedule_iep, pattern);
     // approximate_exact_fusion_eightyseven(g, &schedule, schedule_iep, pattern);
     // approximate_exact_fusion_fifty_allrange(g, &schedule, schedule_iep, pattern);
+    // adaptive_approximate_exact_fusion(g, &schedule, schedule_iep, pattern);
     adaptive_ns(g, &schedule);
     // partition_ns(g, &schedule);
     // scale_gpm_ns(g, &schedule); // scalegpm的复现
